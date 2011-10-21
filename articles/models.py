@@ -173,7 +173,7 @@ MARKUP_HELP = _("""Select the type of markup you are using in this article.
 <li><a href="http://thresholdstate.com/articles/4312/the-textile-reference-manual" target="_blank">Textile Guide</a></li>
 </ul>""")
 
-class Article(models.Model):
+class ArticleBase(models.Model):
     title = models.CharField(max_length=100)
     slug = models.SlugField(unique_for_year='publish_date')
     status = models.ForeignKey(ArticleStatus, default=ArticleStatus.objects.default)
@@ -187,27 +187,18 @@ class Article(models.Model):
     content = models.TextField()
     rendered_content = models.TextField()
 
-    tags = models.ManyToManyField(Tag, help_text=_('Tags that describe this article'), blank=True)
-    auto_tag = models.BooleanField(default=AUTO_TAG, blank=True, help_text=_('Check this if you want to automatically assign any existing tags to this article based on its content.'))
-    followup_for = models.ManyToManyField('self', symmetrical=False, blank=True, help_text=_('Select any other articles that this article follows up on.'), related_name='followups')
-    related_articles = models.ManyToManyField('self', blank=True)
-
     publish_date = models.DateTimeField(default=datetime.now, help_text=_('The date and time this article shall appear online.'))
     expiration_date = models.DateTimeField(blank=True, null=True, help_text=_('Leave blank if the article does not expire.'))
 
     is_active = models.BooleanField(default=True, blank=True)
     login_required = models.BooleanField(blank=True, help_text=_('Enable this if users must login before they can read this article.'))
 
-    use_addthis_button = models.BooleanField(_('Show AddThis button'), blank=True, default=USE_ADDTHIS_BUTTON, help_text=_('Check this to show an AddThis bookmark button when viewing an article.'))
-    addthis_use_author = models.BooleanField(_("Use article author's username"), blank=True, default=ADDTHIS_USE_AUTHOR, help_text=_("Check this if you want to use the article author's username for the AddThis button.  Respected only if the username field is left empty."))
-    addthis_username = models.CharField(_('AddThis Username'), max_length=50, blank=True, default=DEFAULT_ADDTHIS_USER, help_text=_('The AddThis username to use for the button.'))
-
     objects = ArticleManager()
 
     def __init__(self, *args, **kwargs):
         """Makes sure that we have some rendered content to use"""
 
-        super(Article, self).__init__(*args, **kwargs)
+        super(ArticleBase, self).__init__(*args, **kwargs)
 
         self._next = None
         self._previous = None
@@ -231,20 +222,17 @@ class Article(models.Model):
         using = kwargs.get('using', DEFAULT_DB)
 
         self.do_render_markup()
-        self.do_addthis_button()
         self.do_meta_description()
-        self.do_unique_slug(using)
 
-        super(Article, self).save(*args, **kwargs)
+        requires_save=False
+        super(ArticleBase, self).save(*args, **kwargs)
 
         # do some things that require an ID first
-        requires_save = self.do_auto_tag(using)
-        requires_save |= self.do_tags_to_keywords()
         requires_save |= self.do_default_site(using)
 
         if requires_save:
             # bypass the other processing
-            super(Article, self).save()
+            super(ArticleBase, self).save()
 
     def do_render_markup(self):
         """Turns any markup into HTML"""
@@ -261,45 +249,6 @@ class Article(models.Model):
 
         return (self.rendered_content != original)
 
-    def do_addthis_button(self):
-        """Sets the AddThis username for this post"""
-
-        # if the author wishes to have an "AddThis" button on this article,
-        # make sure we have a username to go along with it.
-        if self.use_addthis_button and self.addthis_use_author and not self.addthis_username:
-            self.addthis_username = self.author.username
-            return True
-
-        return False
-
-    def do_unique_slug(self, using=DEFAULT_DB):
-        """
-        Ensures that the slug is always unique for the year this article was
-        posted
-        """
-
-        if not self.id:
-            # make sure we have a slug first
-            if not len(self.slug.strip()):
-                self.slug = slugify(self.title)
-
-            self.slug = self.get_unique_slug(self.slug, using)
-            return True
-
-        return False
-
-    def do_tags_to_keywords(self):
-        """
-        If meta keywords is empty, sets them using the article tags.
-
-        Returns True if an additional save is required, False otherwise.
-        """
-
-        if len(self.keywords.strip()) == 0:
-            self.keywords = ', '.join([t.name for t in self.tags.all()])
-            return True
-
-        return False
 
     def do_meta_description(self):
         """
@@ -314,38 +263,6 @@ class Article(models.Model):
 
         return False
 
-    @logtime
-    @once_per_instance
-    def do_auto_tag(self, using=DEFAULT_DB):
-        """
-        Performs the auto-tagging work if necessary.
-
-        Returns True if an additional save is required, False otherwise.
-        """
-
-        if not self.auto_tag:
-            log.debug('Article "%s" (ID: %s) is not marked for auto-tagging. Skipping.' % (self.title, self.pk))
-            return False
-
-        # don't clobber any existing tags!
-        existing_ids = [t.id for t in self.tags.all()]
-        log.debug('Article %s already has these tags: %s' % (self.pk, existing_ids))
-
-        unused = Tag.objects.all()
-        if hasattr(unused, 'using'):
-            unused = unused.using(using)
-        unused = unused.exclude(id__in=existing_ids)
-
-        found = False
-        to_search = (self.content, self.title, self.description, self.keywords)
-        for tag in unused:
-            regex = re.compile(r'\b%s\b' % tag.name, re.I)
-            if any(regex.search(text) for text in to_search):
-                log.debug('Applying Tag "%s" (%s) to Article %s' % (tag, tag.pk, self.pk))
-                self.tags.add(tag)
-                found = True
-
-        return found
 
     def do_default_site(self, using=DEFAULT_DB):
         """
@@ -364,28 +281,6 @@ class Article(models.Model):
 
         return False
 
-    def get_unique_slug(self, slug, using=DEFAULT_DB):
-        """Iterates until a unique slug is found"""
-
-        # we need a publish date before we can do anything meaningful
-        if type(self.publish_date) is not datetime:
-            return slug
-
-        orig_slug = slug
-        year = self.publish_date.year
-        counter = 1
-
-        while True:
-            not_unique = Article.objects.all()
-            if hasattr(not_unique, 'using'):
-                not_unique = not_unique.using(using)
-            not_unique = not_unique.filter(publish_date__year=year, slug=slug)
-
-            if len(not_unique) == 0:
-                return slug
-
-            slug = '%s-%s' % (orig_slug, counter)
-            counter += 1
 
     def _get_article_links(self):
         """
@@ -468,6 +363,132 @@ class Article(models.Model):
         return self._teaser
     teaser = property(_get_teaser)
 
+
+    class Meta:
+        abstract=True
+
+class Article(ArticleBase):
+    tags = models.ManyToManyField(Tag, help_text=_('Tags that describe this article'), blank=True)
+    auto_tag = models.BooleanField(default=AUTO_TAG, blank=True, help_text=_('Check this if you want to automatically assign any existing tags to this article based on its content.'))
+    followup_for = models.ManyToManyField('self', symmetrical=False, blank=True, help_text=_('Select any other articles that this article follows up on.'), related_name='followups')
+    related_articles = models.ManyToManyField('self', blank=True)
+
+    use_addthis_button = models.BooleanField(_('Show AddThis button'), blank=True, default=USE_ADDTHIS_BUTTON, help_text=_('Check this to show an AddThis bookmark button when viewing an article.'))
+    addthis_use_author = models.BooleanField(_("Use article author's username"), blank=True, default=ADDTHIS_USE_AUTHOR, help_text=_("Check this if you want to use the article author's username for the AddThis button.  Respected only if the username field is left empty."))
+    addthis_username = models.CharField(_('AddThis Username'), max_length=50, blank=True, default=DEFAULT_ADDTHIS_USER, help_text=_('The AddThis username to use for the button.'))
+
+    def save(self, *args, **kwargs):
+        """Renders the article using the appropriate markup language."""
+        self.do_unique_slug(using)
+        self.do_addthis_button()
+            
+        requires_save = False
+        super(Article, self).save()
+
+        requires_save = self.do_auto_tag(using)
+        requires_save |= self.do_tags_to_keywords()
+
+        if requires_save:
+            # bypass the other processing
+            super(Article, self).save()
+
+    @logtime
+    @once_per_instance
+    def do_auto_tag(self, using=DEFAULT_DB):
+        """
+        Performs the auto-tagging work if necessary.
+
+        Returns True if an additional save is required, False otherwise.
+        """
+
+        if not self.auto_tag:
+            log.debug('Article "%s" (ID: %s) is not marked for auto-tagging. Skipping.' % (self.title, self.pk))
+            return False
+
+        # don't clobber any existing tags!
+        existing_ids = [t.id for t in self.tags.all()]
+        log.debug('Article %s already has these tags: %s' % (self.pk, existing_ids))
+
+        unused = Tag.objects.all()
+        if hasattr(unused, 'using'):
+            unused = unused.using(using)
+        unused = unused.exclude(id__in=existing_ids)
+
+        found = False
+        to_search = (self.content, self.title, self.description, self.keywords)
+        for tag in unused:
+            regex = re.compile(r'\b%s\b' % tag.name, re.I)
+            if any(regex.search(text) for text in to_search):
+                log.debug('Applying Tag "%s" (%s) to Article %s' % (tag, tag.pk, self.pk))
+                self.tags.add(tag)
+                found = True
+
+        return found
+
+    def do_tags_to_keywords(self):
+        """
+        If meta keywords is empty, sets them using the article tags.
+
+        Returns True if an additional save is required, False otherwise.
+        """
+
+        if len(self.keywords.strip()) == 0:
+            self.keywords = ', '.join([t.name for t in self.tags.all()])
+            return True
+
+        return False
+
+    def do_addthis_button(self):
+        """Sets the AddThis username for this post"""
+
+        # if the author wishes to have an "AddThis" button on this article,
+        # make sure we have a username to go along with it.
+        if self.use_addthis_button and self.addthis_use_author and not self.addthis_username:
+            self.addthis_username = self.author.username
+            return True
+
+        return False
+
+
+    def do_unique_slug(self, using=DEFAULT_DB):
+        """
+        Ensures that the slug is always unique for the year this article was
+        posted
+        """
+
+        if not self.id:
+            # make sure we have a slug first
+            if not len(self.slug.strip()):
+                self.slug = slugify(self.title)
+
+            self.slug = self.get_unique_slug(self.slug, using)
+            return True
+
+        return False
+
+    def get_unique_slug(self, slug, using=DEFAULT_DB):
+        """Iterates until a unique slug is found"""
+
+        # we need a publish date before we can do anything meaningful
+        if type(self.publish_date) is not datetime:
+            return slug
+
+        orig_slug = slug
+        year = self.publish_date.year
+        counter = 1
+
+        while True:
+            not_unique = Article.objects.all()
+            if hasattr(not_unique, 'using'):
+                not_unique = not_unique.using(using)
+            not_unique = not_unique.filter(publish_date__year=year, slug=slug)
+
+            if len(not_unique) == 0:
+                return slug
+
+            slug = '%s-%s' % (orig_slug, counter)
+            counter += 1
+
     def get_next_article(self):
         """Determines the next live article"""
 
@@ -497,6 +518,7 @@ class Article(models.Model):
     class Meta:
         ordering = ('-publish_date', 'title')
         get_latest_by = 'publish_date'
+
 
 class Attachment(models.Model):
     upload_to = lambda inst, fn: 'attach/%s/%s/%s' % (datetime.now().year, inst.article.slug, fn)
